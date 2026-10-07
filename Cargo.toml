@@ -1,0 +1,19 @@
+[package]
+name = "d1rs"
+version = "0.1.0"
+edition = "2021"
+description = "Dependency-free CUDA inference server for LiquidAI d1-omni-600M (GGUF)"
+build = "build.rs"
+
+[dependencies]
+
+[[bin]]
+name = "d1"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+debug = 1

@@ -1,0 +1,4 @@
+/target
+*.gguf
+*.plans
+__pycache__/
