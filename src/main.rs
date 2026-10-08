@@ -4,6 +4,7 @@ mod audio;
 mod cuda;
 mod engine;
 mod gguf;
+mod hub;
 mod image;
 mod json;
 mod media;
@@ -25,11 +26,18 @@ use std::time::Instant;
 const USAGE: &str = "d1 - CUDA inference for LiquidAI d1-omni-600M (GGUF)
 
 USAGE:
-  d1 serve    -m MODEL.gguf [--mmproj MMPROJ.gguf] [--host 127.0.0.1] [--port 8080] [options]
-  d1 run      -m MODEL.gguf [--mmproj ...] REQUEST.json          one request, prints the response
-  d1 eval     -m MODEL.gguf [--mmproj ...] CASES.jsonl            probabilities per case (JSONL)
-  d1 bench    -m MODEL.gguf [--mmproj ...] [--clients 64] [--seconds 10] [--request REQ.json]
-  d1 loadtest --url http://127.0.0.1:8080 [--clients 64] [--seconds 10] [--request REQ.json]
+  d1 serve    [MODEL] [--host 127.0.0.1] [--port 8080] [options]
+  d1 run      [MODEL] REQUEST.json                         one request, prints the response
+  d1 eval     [MODEL] CASES.jsonl                          probabilities per case (JSONL)
+  d1 bench    [MODEL] [--clients 64] [--seconds 10] [--request REQ.json]
+  d1 loadtest --url http://127.0.0.1:8080 [--clients 64] [--seconds 10] [--request A.json,B.json,...]
+  d1 download [--hf REPO[:QUANT][@REV]] [--no-mmproj]      fetch the GGUFs into the cache, print their paths
+
+MODEL (default: download LiquidAI/d1-omni-600M-GGUF:F16 with its mmproj on first use):
+  -m MODEL.gguf [--mmproj MMPROJ.gguf]   local files
+  --hf REPO[:QUANT][@REV]                a Hugging Face repo, e.g. LiquidAI/d1-omni-600M-GGUF:F16 (cached in
+                                         $D1_CACHE or ~/.cache/d1rs/models, sha256-verified; HF_TOKEN for gated repos)
+  --no-mmproj                            text only (skip the vision/audio encoders)
 
 OPTIONS:
   --max-batch-tokens N   tokens per forward batch (default 8192); larger = more throughput, more latency
@@ -56,7 +64,7 @@ fn parse_args() -> Args {
     let mut a = Args { pos: vec![], kv: HashMap::new(), flags: vec![] };
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let valued = ["-m", "--model", "--mmproj", "--host", "--port", "--max-batch-tokens", "--ctx", "--media-cache-mb", "--vision-patches",
-                  "--threads", "--device", "--tune-cache", "--convert", "--clients", "--seconds", "--request", "--url", "--requests"];
+                  "--threads", "--device", "--tune-cache", "--convert", "--hf", "--clients", "--seconds", "--request", "--url", "--requests"];
     let mut i = 0;
     while i < raw.len() {
         let s = &raw[i];
@@ -92,8 +100,21 @@ fn die(msg: &str) -> ! {
     std::process::exit(1)
 }
 
+/// Local files from -m/--mmproj, or files resolved (and downloaded if needed) from the Hugging Face Hub.
+fn model_paths(a: &Args) -> (String, Option<String>) {
+    if let Some(m) = a.get("--model") {
+        return (m.to_string(), a.get("--mmproj").map(|s| s.to_string()));
+    }
+    let spec = a.get("--hf").map(|s| s.to_string()).unwrap_or_else(|| format!("{}:{}", hub::DEFAULT_REPO, hub::DEFAULT_QUANT));
+    let want_mm = !a.flag("--no-mmproj") && a.get("--mmproj").is_none();
+    let r = hub::resolve(&spec, want_mm).unwrap_or_else(|e| die(&format!("{spec}: {e}")));
+    let mm = a.get("--mmproj").map(|s| s.to_string()).or(r.mmproj.map(|p| p.display().to_string()));
+    (r.model.display().to_string(), mm)
+}
+
 fn build_service(a: &Args) -> Arc<service::Service> {
-    let model = a.get("--model").unwrap_or_else(|| die("missing -m MODEL.gguf"));
+    let (model_path, mmproj_path) = model_paths(a);
+    let model = model_path.as_str();
     let dev = a.num("--device", 0) as i32;
     if cuda::device_count() <= dev {
         die("no CUDA device available");
@@ -111,7 +132,7 @@ fn build_service(a: &Args) -> Arc<service::Service> {
     let temps = service::temperatures(&g);
     let name = g.s("general.name").unwrap_or("d1").to_string();
     let (mut vision, mut audio) = (None, None);
-    if let Some(mp) = a.get("--mmproj") {
+    if let Some(mp) = mmproj_path.as_deref() {
         let mg = gguf::Gguf::open(mp).unwrap_or_else(|e| die(&e));
         if mg.get("clip.has_vision_encoder").is_some() {
             vision = Some(vision::VisionModel::load(&mg, a.num("--vision-patches", 11 * 1024)).unwrap_or_else(|e| die(&e)));
@@ -377,10 +398,17 @@ fn main() {
             let b = s.batches.load(Ordering::Relaxed).max(1);
             println!("engine: {} batches, avg {:.0} tokens / {:.1} questions per batch", b, s.tokens.load(Ordering::Relaxed) as f64 / b as f64, s.rows.load(Ordering::Relaxed) as f64 / b as f64);
         }
+        "download" => {
+            let (m, mm) = model_paths(&a);
+            println!("{m}");
+            if let Some(mm) = mm {
+                println!("{mm}");
+            }
+        }
         "tokenize" => {
             // debug: one JSON string per stdin line -> token ids (no special tokens), as JSON arrays
-            let model = a.get("--model").unwrap_or_else(|| die("missing -m"));
-            let g = gguf::Gguf::open(model).unwrap_or_else(|e| die(&e));
+            let (model, _) = model_paths(&a);
+            let g = gguf::Gguf::open(&model).unwrap_or_else(|e| die(&e));
             let tok = tokenizer::Tokenizer::from_gguf(&g).unwrap_or_else(|e| die(&e));
             let stdin = std::io::stdin();
             let mut out = std::io::BufWriter::new(std::io::stdout());

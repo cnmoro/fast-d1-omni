@@ -36,8 +36,28 @@ You need an NVIDIA GPU with compute capability 7.5 or newer (Turing, Ampere, Ada
 ## Run
 
 ```bash
-./target/release/d1 serve -m d1-omni-600M-F16.gguf --mmproj mmproj-d1-omni-600M-F16.gguf --port 8080
+./target/release/d1 serve --port 8080
 ```
+
+That's all you need: with no `-m`, the server downloads `LiquidAI/d1-omni-600M-GGUF` (F16 model plus its F16
+mmproj, about 1.2 GB) on first use. Other ways to pick the model:
+
+```bash
+d1 serve --hf LiquidAI/d1-omni-600M-GGUF:F16          # repo[:quant][@revision]; quant picks <name>-<QUANT>.gguf
+d1 serve --hf LiquidAI/d1-omni-600M-GGUF --no-mmproj  # text only
+d1 serve -m d1-omni-600M-F16.gguf --mmproj mmproj-d1-omni-600M-F16.gguf   # local files, no network
+d1 download                                           # fetch into the cache and print the paths
+```
+
+How downloads work:
+
+- There's no HTTP/TLS client in the code, so downloads use the system `curl` (or `wget` if curl is missing).
+- Files are cached in `$D1_CACHE`, which defaults to `~/.cache/d1rs/models`.
+- An interrupted download resumes where it stopped.
+- Every file is checked against the SHA-256 that the Hub publishes for it. A file with the wrong size or hash is
+  fetched again.
+- Later starts reuse the cached files without the network. If the Hub can't be reached, the cached files are used.
+- `HF_TOKEN` is sent for gated or private repos, and `HF_ENDPOINT` selects a mirror.
 
 The first start autotunes the GEMMs (text, vision and audio shapes) for about three minutes. The result is cached in `~/.cache/d1rs/` and later starts
 take about a second. The request and response format matches the model card:
@@ -183,7 +203,7 @@ and long (cut) clips.
 ## Tests
 
 ```bash
-cargo test --release                                # unit tests (JSON, prompt escaping, media sniffing)
+cargo test --release                                # unit tests (JSON, prompt escaping, media sniffing, SHA-256)
 python3 tests/e2e.py --url http://127.0.0.1:8080    # end to end against a running server
 ```
 
