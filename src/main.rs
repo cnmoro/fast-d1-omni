@@ -150,7 +150,7 @@ fn build_service(a: &Args) -> Arc<service::Service> {
     let cfg = engine::Config {
         tune: !a.flag("--no-tune"),
         tune_cache: a.get("--tune-cache").map(|s| s.to_string()).or(tune_cache),
-        max_batch_tokens: a.num("--max-batch-tokens", 8192).max(64),
+        max_batch_tokens: a.num("--max-batch-tokens", 8192).max(64).min(cap),
         cap_tokens: cap,
         media_cache_bytes: a.num("--media-cache-mb", 1536) << 20,
         fp16_acc: a.flag("--fast"),

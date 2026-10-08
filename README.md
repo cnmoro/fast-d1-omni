@@ -187,6 +187,53 @@ text requests don't queue behind a burst of images. A media request costs about 
 At steady state about 88% of GPU time is GEMMs, running at 80–90% of the fp32-accumulation tensor peak. Larger
 batches can't add much, so `--fast` is the remaining throughput option.
 
+## GPU memory
+
+Measured with `nvidia-smi` as this process's usage (the CUDA context is included):
+
+| configuration | idle | peak under load |
+|---|---:|---:|
+| text only, `--ctx 2048` | 0.99 GB | same |
+| text only, `--ctx 4096` | 1.08 GB | same |
+| text only, `--ctx 8192` | 1.26 GB | same |
+| text only, default `--ctx 16384` | 1.61 GB | same (64 clients, or 16K-token states) |
+| vision + audio, `--ctx 4096 --vision-patches 4096 --media-cache-mb 512` | 1.75 GB | 1.92 GB (mixed load) |
+| vision + audio, defaults | 2.39 GB | 2.42 GB (640×480 images), 2.45 GB (30 s audio), 2.49 GB (13-crop tiled images) |
+| vision + audio, defaults, everything mixed incl. 16K states and tiled images, 48 clients | 2.39 GB | 2.59–2.81 GB |
+
+Where it goes:
+
+- **Weights:** about 0.73 GB for the text model and 0.6 GB for the vision and audio encoders.
+- **Text workspace:** about 44 KB per token of `--ctx`, so 0.7 GB at 16384. It is allocated once at startup, so text
+  traffic never grows memory. `--max-batch-tokens` doesn't change memory; it is clamped to `--ctx`.
+- **Vision scratch:** about 150 MB at the default `--vision-patches 11264`, which fits one fully tiled image (eleven
+  512 px crops) in a single tower pass. Lower values still accept any image; the crops are processed in several
+  passes.
+- **Audio scratch:** about 170 MB, sized for a 30 s clip.
+- **Media in flight:** each request with an image or audio keeps its cached prefix (K/V of the 6 attention layers)
+  until its questions finish, at 12 KB per prefix token:
+  - 2.9 MB for a 640×480 photo (234 tokens);
+  - 4.6 MB for 30 s of audio (375 tokens);
+  - 35 MB for a fully tiled image (2,816 tokens).
+
+  These caches come from a stream-ordered pool capped by `--media-cache-mb` (default 1536). When the cap is reached,
+  later media requests wait their turn.
+
+For small GPUs, `--ctx` is the main lever. Use `--no-mmproj` (with `--hf`) or omit `--mmproj` (with `-m`) for text
+only. Note that `--ctx` also caps the longest question; longer states are truncated, as in the reference
+implementation.
+
+## Scheduling
+
+Rows are packed FIFO across requests. Two rules keep latency fair under mixed load:
+
+- Text batches go to the GPU before media work on every iteration.
+- A long question (more than half of `--max-batch-tokens`, such as a 16K-token state) fills a whole batch by itself.
+  While short work is waiting, long rows get at most about a quarter of the recent GPU cost.
+
+With clients sending 2 × 16K-token questions continuously alongside normal traffic, short text requests stay under
+about 1 s; their worst case is waiting for one long batch already on the GPU. Without this rule they waited 3–12 s.
+
 ## Accuracy
 
 Compared against the original PyTorch model (`trust_remote_code`, fp32) on 69 text cases, 14 image cases and 5 audio

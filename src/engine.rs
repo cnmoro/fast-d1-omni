@@ -134,6 +134,8 @@ pub fn start(models: Models, cfg: Config) -> EngineHandle {
                 inflight: VecDeque::new(),
                 slot: 0,
                 cache_bytes: 0,
+                long_cost: 0.0,
+                short_cost: 0.0,
                 stats: st2,
             };
             ready_tx.send(()).ok();
@@ -157,6 +159,8 @@ struct Engine {
     inflight: VecDeque<InFlight>,
     slot: usize,
     cache_bytes: usize,
+    long_cost: f64,
+    short_cost: f64,
     stats: Arc<Stats>,
 }
 
@@ -381,6 +385,7 @@ impl Engine {
         }
         self.inflight.push_back(InFlight { pending: None, rows: Vec::new() });
         unsafe { cuda::free_async(emb as *mut c_void, st) };
+        self.short_cost += 3.0 * total as f64;
         for (&(id, _, _), cache) in ok.iter().zip(caches) {
             self.cache_bytes += cache.bytes;
             self.stats.media.fetch_add(1, Ordering::Relaxed);
@@ -392,7 +397,19 @@ impl Engine {
 
     /// Pack rows FIFO across jobs into one batch and launch it.
     fn launch_batch(&mut self) -> bool {
+        // A long question (more than half the budget) fills a whole batch on its own. After a batch with long rows,
+        // the next few iterations prefer short rows and media, so short requests never queue behind a run of long
+        // ones; long rows still run whenever nothing short is waiting.
+        // While short work is waiting, long rows get at most about a quarter of the recent GPU cost (in tokens).
+        if self.long_cost * 3.0 > self.short_cost && self.launch_batch_filtered(true) {
+            return true;
+        }
+        self.launch_batch_filtered(false)
+    }
+
+    fn launch_batch_filtered(&mut self, short_only: bool) -> bool {
         let budget = self.cfg.max_batch_tokens;
+        let long = (budget / 2).max(1);
         let mut picked: Vec<(u64, usize)> = Vec::new();
         let mut tokens = 0;
         let mut markers = 0;
@@ -409,6 +426,9 @@ impl Engine {
             for r in js.next_row..js.job.rows.len() {
                 let n = js.job.rows[r].ids.len();
                 let nm = js.job.rows[r].markers.len();
+                if short_only && n > long {
+                    continue 'outer;
+                }
                 if !picked.is_empty() && (tokens + n > budget || markers + nm > self.ws.cap_markers) {
                     break 'outer;
                 }
@@ -430,6 +450,16 @@ impl Engine {
         }
         if picked.is_empty() {
             return false;
+        }
+        let _ = short_only;
+        if picked.iter().any(|&(id, r)| self.jobs[&id].job.rows[r].ids.len() > long) {
+            self.long_cost += tokens as f64;
+        } else {
+            self.short_cost += tokens as f64;
+        }
+        if self.long_cost + self.short_cost > 4e6 {
+            self.long_cost *= 0.5;
+            self.short_cost *= 0.5;
         }
         let slot = self.next_slot();
         let mut rows_meta = Vec::with_capacity(picked.len());
@@ -570,6 +600,8 @@ fn tune(models: &Models, blas: &Blas, ws: &mut Workspace, st: Stream, cfg: &Conf
         }
     }
     let _ = gain.1;
+    cuda::stream_sync(st);
+    blas.free_tuning_scratch();
     if loaded <= 0 || t0.elapsed().as_secs_f64() > 1.0 {
         eprintln!("\rtuned {total} GEMM shapes in {:.1}s", t0.elapsed().as_secs_f64());
     }

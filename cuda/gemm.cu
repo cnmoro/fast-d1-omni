@@ -315,4 +315,15 @@ int d1_lt_load(void* ctx, const char* path) {
 
 int d1_lt_bucket(int m) { return bucket_of(m); }
 
+// Release the tuning scratch buffers (they can be ~1 GB at the largest buckets).
+void d1_lt_free_scratch(void* ctx) {
+    Ctx* c = (Ctx*)ctx;
+    for (void** p : {&c->sx, &c->sw, &c->sy})
+        if (*p) {
+            cudaFree(*p);
+            *p = nullptr;
+        }
+    c->sx_b = c->sw_b = c->sy_b = 0;
+}
+
 }  // extern "C"

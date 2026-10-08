@@ -171,6 +171,7 @@ extern "C" {
     fn d1_lt_save(ctx: *mut c_void, path: *const c_char) -> c_int;
     fn d1_lt_load(ctx: *mut c_void, path: *const c_char) -> c_int;
     pub fn d1_lt_bucket(m: c_int) -> c_int;
+    fn d1_lt_free_scratch(ctx: *mut c_void);
 }
 
 pub fn err_str(e: c_int) -> String {
@@ -413,6 +414,9 @@ impl Blas {
                 s.ldy as c_int, s.y_f32 as c_int, s.f16acc as c_int, effort, st,
             )
         }
+    }
+    pub fn free_tuning_scratch(&self) {
+        unsafe { d1_lt_free_scratch(self.lt) };
     }
     pub fn save_plans(&self, path: &str) -> bool {
         let c = std::ffi::CString::new(path).unwrap();
